@@ -5,6 +5,7 @@ import os
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Dense, Dropout, GRU
+import math
 
 def create_sequences(data, timestep, target_col_idx):
     X, Y = [], []
@@ -52,6 +53,8 @@ def get_predictions(df_raw, freq, timestep, model_name, feature_cols, epochs, cu
         model = build_gru_model((X_train.shape[1], X_train.shape[2]))
         model.fit(X_train, Y_train, epochs=epochs, batch_size=32, validation_split=0.2, verbose=1)
         model.save(model_name)
+
+    model.summary()
 
     preds_scaled = model.predict(X_test)
     
@@ -136,9 +139,11 @@ class Trader:
         self.strategy = strategy 
         self.balance = 100000.0
         self.btc = 0.0
+        self.avg_entry_price = 0.0
         self.history = []
         self.max_debt = 500000.0
         self.is_locked = False
+        self.min_angle = 8.0
 
     @property
     def current_debt(self):
@@ -147,29 +152,33 @@ class Trader:
     def execute(self, action, current_price, angle):
         fee = current_price * 0.001 
         
-        if self.strategy == 'opt' and self.is_locked and angle < 0:
-            if self.btc > 0:
-                revenue = (self.btc * current_price) - fee
-                self.balance += revenue
-                self.btc = 0
-            
-            current_debt_val = self.current_debt
-            if current_debt_val > 0:
-                debt_payment = current_debt_val / 2
-                self.balance += debt_payment
+        if self.strategy == 'opt' and self.is_locked:
+            if angle > self.min_angle:
+                revenue_total = (self.btc * current_price) - fee
+                cost_basis = self.btc * self.avg_entry_price
+                net_gain = revenue_total - cost_basis
                 
-            self.is_locked = False
+                required_gain = self.current_debt * 0.5
+
+                if net_gain >= required_gain:
+                    self.balance += revenue_total
+                    self.btc = 0
+                    self.avg_entry_price = 0.0
+                    self.is_locked = False
             
             net_worth = self.balance + (self.btc * current_price)
             self.history.append(net_worth)
             return
 
-        excess_angle = abs(angle) - 15
+        excess_angle = abs(angle) - self.min_angle
         if excess_angle < 0: excess_angle = 0
-        btc_qty = 1.0 + (np.log1p(excess_angle) * 1.5)
+        btc_qty = 1.0 + (math.log1p(excess_angle) * 1.5)
 
         if action == 'buy':
-            if self.is_locked: return 
+            if self.is_locked: 
+                net_worth = self.balance + (self.btc * current_price)
+                self.history.append(net_worth)
+                return 
 
             cost_total = (btc_qty * current_price) + fee
             available_funds = self.balance + self.max_debt
@@ -180,8 +189,12 @@ class Trader:
                 btc_qty = available_funds / current_price
                 cost_total = available_funds
             
-            self.balance -= cost_total
+            old_total_cost = self.btc * self.avg_entry_price
+            new_total_cost = old_total_cost + cost_total
             self.btc += btc_qty
+            self.avg_entry_price = new_total_cost / self.btc if self.btc > 0 else 0.0
+            
+            self.balance -= cost_total
 
             if self.current_debt >= (self.max_debt * 0.99):
                 self.is_locked = True
@@ -191,6 +204,7 @@ class Trader:
                 revenue = (self.btc * current_price) - fee
                 self.balance += revenue
                 self.btc = 0
+                self.avg_entry_price = 0.0
                 
                 if self.is_locked and self.current_debt < (self.max_debt / 2):
                     self.is_locked = False
@@ -210,95 +224,11 @@ traders = [
     Trader("Apostador Pesimista", "pes")
 ]
 
-look_ahead = 5       
-step = 5             
-y_scale_factor = 50.0 
+look_ahead = 5      
+step = 5            
 
 print(f"\n--- Iniciando Simulación (Step: {step} min) ---")
 
-df_sim = df_ens[df_ens.index >= '2025-01-01'].copy()
-
-for i in range(0, len(df_sim) - look_ahead, step):
-    idx_now = i
-    idx_future = i + look_ahead
-
-    pred_now = df_sim['Weighted'].iloc[idx_now]
-    pred_future = df_sim['Weighted'].iloc[idx_future]
-    price_real_execution = df_sim['Real_Price'].iloc[idx_now]
-    
-    if pd.isna(price_real_execution): continue 
-
-    dy = (pred_future - pred_now) / y_scale_factor
-    dx = look_ahead 
-    angle = np.degrees(np.arctan(dy / dx))
-
-    if abs(angle) > 15:
-        for t in traders:
-            action = 'none'
-            if t.strategy == 'opt':
-                action = 'buy'
-            elif t.strategy == 'pes':
-                if angle > 0: action = 'buy'
-                else: action = 'sell'
-            
-            t.execute(action, price_real_execution, angle)
-    else:
-        for t in traders:
-            if t.strategy == 'opt' and t.is_locked and angle < 0:
-                 t.execute('none', price_real_execution, angle)
-            else:
-                current_val = t.balance + (t.btc * price_real_execution)
-                t.history.append(current_val)
-
-plt.figure(figsize=(15, 7))
-raw_dates = df_sim.index[::step]
-
-for t in traders:
-    min_len = min(len(raw_dates), len(t.history))
-    safe_dates = raw_dates[:min_len]
-    safe_history = t.history[:min_len]
-
-    final_worth = safe_history[-1]
-    final_debt = t.current_debt
-    
-    label_text = (f'{t.name}\n'
-                  f'  -> Patr: ${final_worth:,.0f} | Deuda: ${final_debt:,.0f}'
-                  f'{" [BLOQ]" if t.is_locked else ""}')
-    
-    plt.plot(safe_dates, safe_history, label=label_text, linewidth=2)
-
-plt.title(f'Simulación Enero 2025: Logarítmica con Deuda (Protegido)')
-plt.ylabel('Patrimonio Neto (USD)')
-plt.xlabel('Fecha')
-plt.legend(loc='upper left', fontsize=9)
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-
-
-if df_ens.empty:
-    print("No se puede simular: Falta el DataFrame del promedio ponderado.")
-    exit()
-
-# Preparar precio real alineado
-s_real_min = pd.Series(results['Minuto']['real'], index=results['Minuto']['idx'])
-df_ens['Real_Price'] = s_real_min.reindex(df_ens.index).ffill()
-
-# Instanciar Traders
-traders = [
-    Trader("Apostador Optimista", "opt"), 
-    Trader("Apostador Pesimista", "pes")
-]
-
-# Configuración Simulación
-look_ahead = 5       
-step = 5             
-y_scale_factor = 50.0 
-
-print(f"\n--- Iniciando Simulación (Step: {step} min) ---")
-
-# CORRECCIÓN AQUÍ: Filtrar estrictamente solo Enero
 mask_sim = (df_ens.index >= '2025-01-01') & (df_ens.index <= '2025-01-31')
 df_sim = df_ens[mask_sim].copy()
 
@@ -312,11 +242,13 @@ for i in range(0, len(df_sim) - look_ahead, step):
     
     if pd.isna(price_real_execution): continue 
 
-    dy = (pred_future - pred_now) / y_scale_factor
-    dx = look_ahead 
-    angle = np.degrees(np.arctan(dy / dx))
+    if pred_now == 0:
+        angle = 0
+    else:
+        percent_change = ((pred_future - pred_now) / pred_now) * 100
+        angle = math.degrees(math.atan(percent_change))
 
-    if abs(angle) > 15:
+    if abs(angle) > 8:
         for t in traders:
             action = 'none'
             if t.strategy == 'opt':
@@ -327,15 +259,12 @@ for i in range(0, len(df_sim) - look_ahead, step):
             
             t.execute(action, price_real_execution, angle)
     else:
-        # Si no hay acción agresiva, verificar reglas pasivas (como desbloqueo forzado)
         for t in traders:
-            if t.strategy == 'opt' and t.is_locked and angle < 0:
+            if t.strategy == 'opt' and t.is_locked:
                  t.execute('none', price_real_execution, angle)
             else:
                 current_val = t.balance + (t.btc * price_real_execution)
                 t.history.append(current_val)
-
-# --- 6. GRÁFICO 2: RESULTADOS SIMULACIÓN ---
 
 plt.figure(figsize=(15, 7))
 raw_dates = df_sim.index[::step]
@@ -354,7 +283,7 @@ for t in traders:
     
     plt.plot(safe_dates, safe_history, label=label_text, linewidth=2)
 
-plt.title(f'Simulación Enero 2025: Logarítmica con Deuda (Protegido)')
+plt.title(f'Simulación Enero 2025: Lógica Porcentual (Min 8°)')
 plt.ylabel('Patrimonio Neto (USD)')
 plt.xlabel('Fecha')
 plt.legend(loc='upper left', fontsize=9)
